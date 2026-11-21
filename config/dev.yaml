@@ -14,4 +14,4 @@ database_prefix: meesho_dev
 
 # Optional notification mailbox. CloudFormation creates the SNS subscription;
 # the recipient confirms the email once. Leave blank to use the SNS topic only.
-alert_email: ''
+alert_email: 'thoshanchintu38572@gmail.com'
