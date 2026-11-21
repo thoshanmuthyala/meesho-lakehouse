@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "delivery_name": "meesho-september-2026",
+  "mode": "INITIAL",
+  "files": [
+    {
+      "entity": "customer",
+      "path": "customer/25d76e4eb1113e5149f52b64bd7a765050d50c6a8c9c871774e2961fb8843bf5.jsonl",
+      "rows": 6000,
+      "sha256": "25d76e4eb1113e5149f52b64bd7a765050d50c6a8c9c871774e2961fb8843bf5"
+    },
+    {
+      "entity": "order_item",
+      "path": "order_item/a4048aeb3f66a41672c2500c5601d04c9fcdb1dd96201b0bc208d2d405775257.jsonl",
+      "rows": 60290,
+      "sha256": "a4048aeb3f66a41672c2500c5601d04c9fcdb1dd96201b0bc208d2d405775257"
+    },
+    {
+      "entity": "payment",
+      "path": "payment/635e77017ae64c5f078a51ac17ecfeecb262542ecb9b7b0a3323bbc2333151f6.jsonl",
+      "rows": 10042,
+      "sha256": "635e77017ae64c5f078a51ac17ecfeecb262542ecb9b7b0a3323bbc2333151f6"
+    },
+    {
+      "entity": "product",
+      "path": "product/289f9bce4a2ba17dfc0cd885f2c34f9816bca7dfe4cab4f1058d93c7f4b4c263.jsonl",
+      "rows": 600,
+      "sha256": "289f9bce4a2ba17dfc0cd885f2c34f9816bca7dfe4cab4f1058d93c7f4b4c263"
+    },
+    {
+      "entity": "refund",
+      "path": "refund/8854946895b032c098509b7348df0f91294ca5e2946a883177492a912595501e.jsonl",
+      "rows": 3016,
+      "sha256": "8854946895b032c098509b7348df0f91294ca5e2946a883177492a912595501e"
+    },
+    {
+      "entity": "return",
+      "path": "return/07f83616bf1870800de666df4762e2b4379c70627b99f4964f2d4a4df2987e16.jsonl",
+      "rows": 3014,
+      "sha256": "07f83616bf1870800de666df4762e2b4379c70627b99f4964f2d4a4df2987e16"
+    },
+    {
+      "entity": "shipment",
+      "path": "shipment/a39e3f7e5e0ce3e6b6703cc53e64fd240b2993735f7573fb0eff6b32c031098a.jsonl",
+      "rows": 24138,
+      "sha256": "a39e3f7e5e0ce3e6b6703cc53e64fd240b2993735f7573fb0eff6b32c031098a"
+    }
+  ]
+}

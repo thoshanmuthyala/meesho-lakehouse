@@ -1,0 +1,33 @@
+# CodeBuild validation instructions, shared by the dev and prod pipelines.
+# CodePipeline supplies the captured Git source as a ZIP; no Git clone is needed.
+# This build has a read-only artifact/logging role and cannot deploy AWS resources.
+# A failed command stops the pipeline before deployment (or production approval).
+version: 0.2
+
+phases:
+  # Prepare the Python tools used by the configuration checks and offline tests.
+  install:
+    on-failure: ABORT
+    runtime-versions:
+      python: '3.11'
+    commands:
+      - pip install -r requirements-dev.txt
+
+  build:
+    on-failure: ABORT
+    commands:
+      # 1.) Environment and resource names come from the deployed CodeBuild project.
+      # SOURCE_BRANCH comes from the CodePipeline source action, not a guessed name.
+      # Reject dev/main or resource-name mismatches before using any AWS resources.
+      - python ops/environment.py --environment "$TARGET_ENVIRONMENT" --check-pipeline
+
+      # This is the exact commit captured when this pipeline execution started.
+      - test -n "$CODEBUILD_RESOLVED_SOURCE_VERSION"
+      - echo "Validating $SOURCE_BRANCH revision $CODEBUILD_RESOLVED_SOURCE_VERSION for $PROJECT"
+
+      # Exercise data contracts, financial totals, recovery and environment isolation.
+      - python -m unittest discover -s tests -v
+
+      # cfn-lint is the tool's official name. It validates CloudFormation resource
+      # types, properties, references and intrinsic functions without deploying them.
+      - cfn-lint cloudformation/*.yaml

@@ -1,0 +1,116 @@
+# Create the data storage used by the lakehouse in one environment.
+# CodeBuild deploys this stack automatically before deploying platform.yaml.
+# The bootstrap stack has already created the encryption key passed in below.
+#
+# Parameters are inputs from CodeBuild. Resources are the bucket and its policy.
+# Outputs gives CodeBuild the bucket name to pass to the processing services.
+# !Ref reads an input or resource ID; !GetAtt reads an attribute such as ARN.
+# !Sub fills ${...} placeholders. AWS::Region is us-east-1 when deployed there.
+
+# DeletionPolicy: Delete removes the resource when its stack is deleted.
+# UpdateReplacePolicy: Delete removes the old resource if an update replaces it.
+# Normal in-place updates keep existing data; deleting storage permanently removes it.
+# Delete stacks in this order: platform, foundation, bootstrap (see RUNBOOK.md).
+#
+# CloudFormation template syntax version; keep this value when editing the project.
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Meesho encrypted data bucket and landing protection.
+# Inputs: entered in the Console for bootstrap, or supplied by CodeBuild for other stacks.
+Parameters:
+  # CodeBuild supplies meesho-dev or meesho-prod from the checked configuration.
+  Project:
+    Type: String
+    AllowedPattern: '[a-z][a-z0-9-]{2,25}'
+  # CodeBuild supplies the KMS key ARN created by bootstrap.yaml.
+  KeyArn:
+    Type: String
+# Create the resources below and connect them through their references.
+Resources:
+  # 1. Creates: An S3 bucket for this environment's business data.
+  # Used by: Uploader, crawler, Glue jobs, Lambda functions and Athena.
+  # Why: Keep source files, Iceberg data, quality results and query output together.
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      # Add account and Region to the environment prefix for a distinct bucket name.
+      BucketName: !Sub '${Project}-data-${AWS::AccountId}-${AWS::Region}'
+      # Keep an S3 version ID for each saved object version.
+      VersioningConfiguration:
+        Status: Enabled
+      # Send S3 events to EventBridge; platform.yaml filters for ready manifests.
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      # Prevent public bucket/object access; approved IAM identities still have access.
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # Encrypt new files with the supplied KMS key. Bucket keys reduce KMS requests.
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !Ref 'KeyArn'
+            BucketKeyEnabled: true
+
+  # 2. Creates: Access rules attached to the data bucket.
+  # Used by: S3 checks these rules when the uploader or services access files.
+  # Why: Require HTTPS and protect source deliveries from accidental overwrites.
+  DataPolicy:
+    Type: AWS::S3::BucketPolicy
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Bucket: !Ref 'DataBucket'
+      PolicyDocument:
+        # IAM policy syntax version; keep this value when changing permissions.
+        Version: '2012-10-17'
+        Statement:
+          # Reject this request when the Condition below is true; Principal: * means any caller.
+          - Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: [!GetAtt 'DataBucket.Arn', !Sub '${DataBucket.Arn}/*']
+            Condition:
+              Bool:
+                # HTTP matches this deny rule; HTTPS does not match it.
+                'aws:SecureTransport': 'false'
+          # Reject this request when the Condition below is true; Principal: * means any caller.
+          - Effect: Deny
+            Principal: '*'
+            Action: s3:PutObject
+            Resource: [!Sub '${DataBucket.Arn}/landing/objects/*', !Sub '${DataBucket.Arn}/landing/manifests/*']
+            Condition:
+              # Reject a landing upload if the If-None-Match header is missing.
+              # Our uploader sends If-None-Match: * to create a key only if it does not exist.
+              'Null':
+                's3:if-none-match': 'true'
+
+  # 3. Creates: A callback CloudFormation runs before deleting the data bucket.
+  # Used by: CloudFormation calls the helper created in bootstrap.yaml.
+  # Why: Remove current files, old versions, delete markers and incomplete uploads.
+  DataCleanup:
+    Type: Custom::EnvironmentCleanup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    # Keep the bucket's access policy until cleanup finishes, then delete the policy/bucket.
+    DependsOn: DataPolicy
+    Properties:
+      ServiceToken:
+        Fn::ImportValue: !Sub '${Project}-cleanup-service-token'
+      ServiceTimeout: 900
+      Mode: Data
+      Bucket: !Ref 'DataBucket'
+
+# Show these values in the stack Outputs tab for inspection and downstream use.
+# CodeBuild and upload_delivery.py read DataBucket here instead of asking you to copy its name.
+Outputs:
+  DataBucket:
+    Value: !Ref 'DataBucket'
+    # Platform imports this name, preventing foundation deletion while runtime exists.
+    Export:
+      Name: !Sub '${Project}-data-bucket'

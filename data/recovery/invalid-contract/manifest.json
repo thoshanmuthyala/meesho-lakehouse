@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "delivery_name": "invalid-contract",
+  "mode": "REPLAY",
+  "files": [
+    {
+      "entity": "order_item",
+      "path": "order_item/b0414b1096ad046dd7fe66f41ea6cfbc1667b93354cd91d9d74c8f09865a26f3.jsonl",
+      "rows": 1,
+      "sha256": "b0414b1096ad046dd7fe66f41ea6cfbc1667b93354cd91d9d74c8f09865a26f3"
+    }
+  ]
+}

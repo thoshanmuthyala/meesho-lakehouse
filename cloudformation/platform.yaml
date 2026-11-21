@@ -1,0 +1,1058 @@
+
+# Create the data-processing services for one environment: dev or prod.
+# CodeBuild deploys this stack after the foundation bucket and code release exist.
+# Data flow: S3 manifest -> EventBridge -> SQS -> intake Lambda -> DynamoDB.
+# The scheduled coordinator starts Crawler -> Bronze -> Silver -> Gold.
+# Athena reads the published tables; CloudWatch and SNS provide monitoring.
+#
+# Parameters are inputs supplied by CodeBuild. Resources are things AWS creates.
+# Names such as Registry are labels inside this file; Properties sets AWS settings.
+# !Ref reads an input or resource ID; !GetAtt reads an attribute such as ARN.
+# An ARN is a full AWS resource identifier. !Sub fills ${...} placeholders.
+# AWS::AccountId and AWS::Region come from the deployment account and Region.
+# CloudFormation follows references to create dependencies before their users.
+
+# DeletionPolicy: Delete removes the resource when its stack is deleted.
+# UpdateReplacePolicy: Delete removes the old resource if an update replaces it.
+# Normal in-place updates keep existing data; deleting storage permanently removes it.
+# Delete stacks in this order: platform, foundation, bootstrap (see RUNBOOK.md).
+#
+# CloudFormation template syntax version; keep this value when editing the project.
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Meesho crawler-first Glue workflow, advisory data quality and DynamoDB tracking.
+
+# Inputs: entered in the Console for bootstrap, or supplied by CodeBuild for other stacks.
+Parameters:
+  # CodeBuild supplies the resource-name prefix: meesho-dev or meesho-prod.
+  Project:
+    Type: String
+    Default: meesho-dev
+    AllowedPattern: '[a-z][a-z0-9-]{2,25}'
+  # CodeBuild supplies meesho_dev or meesho_prod for Glue database names.
+  DatabasePrefix:
+    Type: String
+    Default: meesho_dev
+    AllowedPattern: '[a-z][a-z0-9_]{2,25}'
+  # Bucket name returned by foundation.yaml; jobs read and write data here.
+  DataBucket:
+    Type: String
+  # Bucket name created by bootstrap.yaml; Lambda/Glue load their code here.
+  ArtifactBucket:
+    Type: String
+  # KMS key ARN from bootstrap.yaml; services use it for encrypted S3 access.
+  KeyArn:
+    Type: String
+  # CodeBuild release folder containing the exact Lambda, Glue and SQL files.
+  ReleaseId:
+    Type: String
+    AllowedPattern: '[A-Za-z0-9_-]+'
+  # CodeBuild deploys with DISABLED, checks readiness, then enables the schedule.
+  ScheduleState:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [ENABLED, DISABLED]
+
+  # Optional mailbox from config/dev.yaml or config/prod.yaml; blank skips email.
+  AlertEmail:
+    Type: String
+    Default: ''
+
+# Decide whether an optional part of this stack should be included.
+Conditions:
+  # True when an email was supplied: create the SNS subscription.
+  HasAlertEmail: !Not [!Equals [!Ref 'AlertEmail', '']]
+
+# Create the resources below and connect them through their references.
+Resources:
+
+  # 1. Creates: A DynamoDB table for delivery state and workflow ownership.
+  # Used by: Intake registers batches; coordinator and Glue jobs update their progress.
+  # Why: Track pending work and stop two deliveries from writing at the same time.
+  Registry:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub '${Project}-registry'
+      # Stack deletion is allowed to remove this table and its delivery history.
+      DeletionProtectionEnabled: false
+      # Use on-demand billing instead of setting read/write capacity numbers.
+      BillingMode: PAY_PER_REQUEST
+      # Declare only indexed fields. Other batch details can be stored without listing them here.
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: state
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      # pk identifies BATCH#<id>, the CONTROL ownership item, or the MAINTENANCE gate.
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      # Coordinator looks up PENDING batches and orders them by created_at.
+      # Items without state/created_at, such as CONTROL, are absent from this index.
+      GlobalSecondaryIndexes:
+        - IndexName: state-created
+          KeySchema:
+            - AttributeName: state
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      # Enable DynamoDB recovery to an earlier point in time if state is damaged.
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      # Encrypt the stored registry data with DynamoDB server-side encryption.
+      SSESpecification:
+        SSEEnabled: true
+
+  # 2. Creates: An SNS topic named <project>-alerts.
+  # Used by: Coordinator publishes failures/warnings; CloudWatch publishes alarms.
+  # Why: Send operational notifications to confirmed topic subscribers.
+  Alerts:
+    Type: AWS::SNS::Topic
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TopicName: !Sub '${Project}-alerts'
+
+  # 3. Creates: An optional email subscription to the Alerts topic.
+  # Used by: The person receiving notifications at AlertEmail.
+  # Why: Deliver alerts to a mailbox after its owner confirms the SNS email.
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    # Create this resource only when AlertEmail is non-empty.
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref 'Alerts'
+      Protocol: email
+      Endpoint: !Ref 'AlertEmail'
+
+  # 4. Creates: An SQS dead-letter queue, shortened to DLQ.
+  # Used by: EventBridge stores failed sends; intake queue stores exhausted retries.
+  # Why: Keep undelivered messages for investigation for up to 14 days.
+  DeadLetters:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      QueueName: !Sub '${Project}-dlq'
+      # 1209600 seconds = 14 days; messages still need investigation and deliberate replay.
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  # 5. Creates: An SQS queue for ready-manifest notifications.
+  # Used by: EventBridge adds messages; Lambda polls them for the intake function.
+  # Why: Buffer deliveries while intake is busy and retry processing failures.
+  IntakeQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      QueueName: !Sub '${Project}-intake'
+      # Hide a received message for 30 minutes while intake handles it; retries may occur later.
+      VisibilityTimeout: 1800
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      # After five receives without successful deletion, move the message to DeadLetters.
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt 'DeadLetters.Arn'
+        maxReceiveCount: 5
+
+  # 6. Creates: An EventBridge rule matching ready-manifest uploads.
+  # Used by: S3 supplies events; this rule forwards matching events to IntakeQueue.
+  # Why: Start intake only after the uploader writes its final manifest.
+  ManifestRule:
+    Type: AWS::Events::Rule
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub '${Project}-manifests'
+      # Match Object Created events from this data bucket only, under landing/manifests/.
+      EventPattern:
+        source: [aws.s3]
+        detail-type: [Object Created]
+        detail:
+          bucket:
+            name: [!Ref 'DataBucket']
+          object:
+            key:
+              - prefix: 'landing/manifests/'
+      # Forward the matched event to SQS. If sending fails after retries, keep it in the DLQ.
+      Targets:
+        - Id: intake
+          Arn: !GetAtt 'IntakeQueue.Arn'
+          DeadLetterConfig:
+            Arn: !GetAtt 'DeadLetters.Arn'
+
+  # 7. Creates: A permission policy on IntakeQueue and DeadLetters.
+  # Used by: The specific EventBridge ManifestRule above.
+  # Why: Allow that rule to send messages to these queues.
+  QueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Queues: [!Ref 'IntakeQueue', !Ref 'DeadLetters']
+      PolicyDocument:
+        # IAM policy syntax version; keep this value when changing permissions.
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: [!GetAtt 'IntakeQueue.Arn', !GetAtt 'DeadLetters.Arn']
+            Condition:
+              # Limit this permission to ManifestRule, rather than every EventBridge rule.
+              ArnEquals:
+                'aws:SourceArn': !GetAtt 'ManifestRule.Arn'
+
+  # 8. Creates: A shared IAM role for this environment's processing services.
+  # Used by: Intake/coordinator Lambdas, the crawler, and all three Glue jobs.
+  # Why: Give those services access to data, Catalog tables, state and logs.
+  RuntimeRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RoleName: !Sub '${Project}-runtime'
+      # Trust policy: name the AWS service allowed to use this role.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com, glue.amazonaws.com]
+            Action: sts:AssumeRole
+      # Permission policy: Action says what is allowed; Resource says where.
+      # Effect: Allow grants the listed operations to the service using this role.
+      Policies:
+        - PolicyName: project-resources
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Crawler and jobs list input files; processing services check bucket locations.
+              - Effect: Allow
+                Action: ['s3:ListBucket', 's3:GetBucketLocation']
+                Resource: [!Sub 'arn:${AWS::Partition}:s3:::${DataBucket}', !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucket}']
+              # Lambda/Glue read delivery files and the selected release's scripts.
+              - Effect: Allow
+                Action: ['s3:GetObject', 's3:GetObjectVersion']
+                Resource: [!Sub 'arn:${AWS::Partition}:s3:::${DataBucket}/*', !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/releases/*']
+              # Glue writes Iceberg data, rejected rows, quality results and temporary files.
+              # Gold also needs an output path for Athena view-creation queries.
+              - Effect: Allow
+                Action: ['s3:PutObject', 's3:DeleteObject']
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${DataBucket}/warehouse/*'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${DataBucket}/quarantine/*'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${DataBucket}/quality/*'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${DataBucket}/temporary/*'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${DataBucket}/athena-results/*'
+              # Lambda/Glue decrypt inputs and encrypt their outputs with the project key.
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource: !Ref 'KeyArn'
+              # Intake registers batches; coordinator manages claims; Glue records outcomes.
+              # The index ARN lets coordinator query pending batches by state and time.
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                Resource: [!GetAtt 'Registry.Arn', !Sub '${Registry.Arn}/index/*']
+              # Lambda polls IntakeQueue, passes messages to intake, and deletes acknowledged ones.
+              - Effect: Allow
+                Action: ['sqs:ReceiveMessage', 'sqs:DeleteMessage', 'sqs:GetQueueAttributes']
+                Resource: !GetAtt 'IntakeQueue.Arn'
+              # Coordinator starts/checks workflow runs; Glue jobs read their run properties.
+              - Effect: Allow
+                Action:
+                  - glue:GetWorkflowRun
+                  - glue:GetWorkflowRuns
+                  - glue:GetWorkflowRunProperties
+                  - glue:StartWorkflowRun
+                  - glue:GetJobRun
+                  - glue:GetJobRuns
+                Resource: [!Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:workflow/${Project}-workflow',
+                  !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/${Project}-*']
+              # Crawler writes discovered schemas; jobs read them and register Iceberg tables.
+              # Catalog, database and table ARNs cover the Glue metadata hierarchy.
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:GetPartitions
+                  - glue:BatchGetPartition
+                  - glue:CreatePartition
+                  - glue:BatchCreatePartition
+                  - glue:UpdatePartition
+                Resource: [!Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog', !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${DatabasePrefix}_*',
+                  !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${DatabasePrefix}_*/*']
+              # Glue publishes data-quality results and metrics; these APIs use Resource: *.
+              - Effect: Allow
+                Action: ['glue:PublishDataQuality', 'cloudwatch:PutMetricData']
+                Resource: '*'
+              # Lambda functions, crawler and Glue jobs write execution logs for investigation.
+              - Effect: Allow
+                Action: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents']
+                Resource: [!Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${Project}-*',
+                  !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/*']
+              # Gold starts and checks Athena queries that create the reporting views.
+              - Effect: Allow
+                Action: ['athena:StartQueryExecution', 'athena:GetQueryExecution', 'athena:StopQueryExecution']
+                Resource: !Sub 'arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${Project}-analytics'
+              # Coordinator publishes execution failures and quality warnings to the alert topic.
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref 'Alerts'
+
+  # 9. Creates: A Lambda function running intake.handler from the release ZIP.
+  # Used by: The SQS-to-Lambda connection named IntakeMapping below.
+  # Why: Validate each manifest and register its batch in DynamoDB once.
+  Intake:
+    Type: AWS::Lambda::Function
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    # Keep the log group until its function has been removed.
+    DependsOn: IntakeLogs
+    Properties:
+      FunctionName: !Sub '${Project}-intake'
+      Runtime: python3.11
+      # Handler is Python-module.function inside lambdas.zip; Lambda calls that function.
+      Handler: intake.handler
+      Role: !GetAtt 'RuntimeRole.Arn'
+      # Maximum time for one Lambda invocation, in seconds.
+      Timeout: 300
+      MemorySize: 256
+      # Load the exact ZIP that CodeBuild uploaded for ReleaseId.
+      Code:
+        S3Bucket: !Ref 'ArtifactBucket'
+        S3Key: !Sub 'releases/${ReleaseId}/lambdas.zip'
+      # Pass resource names to Python so the same code works in dev and prod.
+      Environment:
+        Variables:
+          DATA_BUCKET: !Ref 'DataBucket'
+          REGISTRY_TABLE: !Ref 'Registry'
+
+  # 10. Creates: The connection between IntakeQueue and the intake Lambda.
+  # Used by: The Lambda service polls SQS using this configuration.
+  # Why: Deliver queued notifications to intake and retry failed messages.
+  IntakeMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      EventSourceArn: !GetAtt 'IntakeQueue.Arn'
+      FunctionName: !Ref 'Intake'
+      # Send up to five SQS messages in one invocation; each message identifies a manifest.
+      BatchSize: 5
+      # Intake reports failed message IDs so only those messages need another attempt.
+      FunctionResponseTypes: [ReportBatchItemFailures]
+
+  # 11. Creates: A Lambda function running coordinator.handler.
+  # Used by: Scheduler calls it regularly; CodeBuild calls it during deployments.
+  # Why: Start one pending delivery, check active runs, and send SNS notifications.
+  Coordinator:
+    Type: AWS::Lambda::Function
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    # Keep the log group until its function has been removed.
+    DependsOn: CoordinatorLogs
+    Properties:
+      FunctionName: !Sub '${Project}-coordinator'
+      Runtime: python3.11
+      # Handler is Python-module.function inside lambdas.zip; Lambda calls that function.
+      Handler: coordinator.handler
+      Role: !GetAtt 'RuntimeRole.Arn'
+      # Maximum time for one Lambda invocation, in seconds.
+      Timeout: 300
+      # Run one coordinator invocation at a time. The DynamoDB CONTROL item
+      # continues protecting the Glue workflow after this short Lambda invocation ends.
+      ReservedConcurrentExecutions: 1
+      # Load the exact ZIP that CodeBuild uploaded for ReleaseId.
+      Code:
+        S3Bucket: !Ref 'ArtifactBucket'
+        S3Key: !Sub 'releases/${ReleaseId}/lambdas.zip'
+      # Pass resource names to Python so the same code works in dev and prod.
+      Environment:
+        Variables:
+          REGISTRY_TABLE: !Ref 'Registry'
+          WORKFLOW_NAME: !Sub '${Project}-workflow'
+          DATA_BUCKET: !Ref 'DataBucket'
+          # Record which code release handled each delivery attempt.
+          RELEASE_ID: !Ref 'ReleaseId'
+          ALERT_TOPIC: !Ref 'Alerts'
+
+  # 12. Creates: An IAM role for EventBridge Scheduler.
+  # Used by: The DispatchSchedule resource below.
+  # Why: Allow the schedule to invoke the coordinator Lambda.
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RoleName: !Sub '${Project}-scheduler'
+      # Trust policy: name the AWS service allowed to use this role.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      # Permission policy: Action says what is allowed; Resource says where.
+      # Effect: Allow grants the listed operations to the service using this role.
+      Policies:
+        - PolicyName: invoke-coordinator
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Scheduler may invoke the coordinator Lambda named here.
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt 'Coordinator.Arn'
+
+  # 13. Creates: A schedule that invokes the coordinator every five minutes.
+  # Used by: Coordinator uses each invocation to check or start a delivery.
+  # Why: Keep processing moving without someone clicking Run in Glue.
+  DispatchSchedule:
+    Type: AWS::Scheduler::Schedule
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub '${Project}-dispatch'
+      # CodeBuild keeps dispatch disabled until deployment checks pass, then enables it.
+      State: !Ref 'ScheduleState'
+      ScheduleExpression: rate(5 minutes)
+      # Request invocation on the schedule without adding a flexible delay window.
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      # Invoke coordinator using SchedulerRole; an empty event means its normal status/start check.
+      Target:
+        Arn: !GetAtt 'Coordinator.Arn'
+        RoleArn: !GetAtt 'SchedulerRole.Arn'
+        Input: '{}'
+
+  # 14. Creates: A Glue workflow grouping the crawler and three jobs.
+  # Used by: Coordinator starts it; Glue triggers run its steps in order.
+  # Why: Track one complete Crawler -> Bronze -> Silver -> Gold execution.
+  Workflow:
+    Type: AWS::Glue::Workflow
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub '${Project}-workflow'
+      # Allow one active workflow per environment so two batches cannot update tables together.
+      MaxConcurrentRuns: 1
+
+  # 15. Creates: An Athena workgroup for this environment's SQL queries.
+  # Used by: Gold creates views through it; analysts query those views through it.
+  # Why: Use a consistent query engine, encrypted result location and scan limit.
+  Athena:
+    Type: AWS::Athena::WorkGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub '${Project}-analytics'
+      # Remove saved queries too; otherwise a populated workgroup can block deletion.
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        # Apply these workgroup settings even if a caller supplies different query settings.
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        # Stop a query if it scans more than 10 GiB.
+        BytesScannedCutoffPerQuery: 10737418240
+        EngineVersion:
+          SelectedEngineVersion: Athena engine version 3
+        # Write query output into the data bucket and encrypt it with the project key.
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${DataBucket}/athena-results/'
+          EncryptionConfiguration:
+            EncryptionOption: SSE_KMS
+            KmsKey: !Ref 'KeyArn'
+
+  # 16. Creates: A Glue crawler that discovers JSON field names and types.
+  # Used by: The workflow runs it first; Bronze and Silver read its Catalog schemas.
+  # Why: Learn source types from the files instead of declaring them in Python.
+  Crawler:
+    Type: AWS::Glue::Crawler
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub '${Project}-raw-discovery'
+      Role: !GetAtt 'RuntimeRole.Arn'
+      DatabaseName: !Ref 'RawDatabase'
+      # The customer folder becomes discovered_customer, and similarly for other entities.
+      TablePrefix: discovered_
+      # Each path holds one entity type, so customer and payment payloads get separate schemas.
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${DataBucket}/landing/objects/customer/'
+          - Path: !Sub 's3://${DataBucket}/landing/objects/product/'
+          - Path: !Sub 's3://${DataBucket}/landing/objects/order_item/'
+          - Path: !Sub 's3://${DataBucket}/landing/objects/payment/'
+          - Path: !Sub 's3://${DataBucket}/landing/objects/shipment/'
+          - Path: !Sub 's3://${DataBucket}/landing/objects/return/'
+          - Path: !Sub 's3://${DataBucket}/landing/objects/refund/'
+      # Combine compatible files into one table per entity, at absolute S3 level 4:
+      # bucket (1) / landing (2) / objects (3) / entity (4). Files sit below the entity.
+      Configuration: '{"Version":1.0,"Grouping":{"TableGroupingPolicy":"CombineCompatibleSchemas","TableLevelConfiguration":4}}'
+      # Recheck all entity folders on each workflow run to discover new source fields.
+      RecrawlPolicy:
+        RecrawlBehavior: CRAWL_EVERYTHING
+      # Update raw Catalog schemas; log missing data instead of deleting Catalog tables.
+      # Changing a raw schema does not migrate an existing Silver/Gold Iceberg table.
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+
+  # 17. Creates: A Glue Catalog database for discovered source schemas.
+  # Used by: Crawler creates discovered_<entity> tables; Bronze/Silver read them.
+  # Why: Store the metadata needed to parse each kind of input file.
+  RawDatabase:
+    Type: AWS::Glue::Database
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      # Register metadata in this AWS account; actual table data stays in S3.
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseInput:
+        Name: !Sub '${DatabasePrefix}_raw'
+
+  # 18. Creates: A Glue Catalog database for accepted event history.
+  # Used by: Bronze registers its Iceberg events table; Silver reads it.
+  # Why: Keep the table definition separate from the event files stored in S3.
+  BronzeDatabase:
+    Type: AWS::Glue::Database
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      # Register metadata in this AWS account; actual table data stays in S3.
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseInput:
+        Name: !Sub '${DatabasePrefix}_bronze'
+
+  # 19. Creates: A Glue Catalog database for current business entities.
+  # Used by: Silver registers entity tables; Gold joins them for reports.
+  # Why: Group validated customer, product, order, payment and related tables.
+  SilverDatabase:
+    Type: AWS::Glue::Database
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      # Register metadata in this AWS account; actual table data stays in S3.
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseInput:
+        Name: !Sub '${DatabasePrefix}_silver'
+
+  # 20. Creates: A Glue Catalog database for reports and publication metadata.
+  # Used by: Gold writes reporting tables; Athena exposes their current versions.
+  # Why: Keep report definitions and the current-publication pointer together.
+  GoldDatabase:
+    Type: AWS::Glue::Database
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      # Register metadata in this AWS account; actual table data stays in S3.
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseInput:
+        Name: !Sub '${DatabasePrefix}_gold'
+
+  # 21. Creates: A Glue Spark job running bronze.py.
+  # Used by: BronzeTrigger starts it after the crawler succeeds.
+  # Why: Parse Catalog-typed inputs, quarantine bad rows and keep unique events.
+  BronzeJob:
+    Type: AWS::Glue::Job
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    # CloudFormation owns the log groups and deletes them after the jobs.
+    DependsOn: [GlueErrorLogs, GlueOutputLogs]
+    Properties:
+      Name: !Sub '${Project}-bronze'
+      Role: !GetAtt 'RuntimeRole.Arn'
+      # Use Glue 5.0 with two G.1X workers for the Spark processing.
+      GlueVersion: '5.0'
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      # Allow at most 60 minutes for this job; failed deliveries are retried through coordinator.
+      Timeout: 60
+      MaxRetries: 0
+      # Allow only one run of this job at a time, matching workflow concurrency.
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      # glueetl runs the selected Python script as a Spark job.
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Sub 's3://${ArtifactBucket}/releases/${ReleaseId}/glue/bronze.py'
+      # common.Run reads these inputs to find the data, registry and Catalog databases.
+      DefaultArguments:
+        # Give this environment its own groups instead of leaving logs in shared defaults.
+        '--custom-logGroup-prefix': !Sub '/aws-glue/${Project}'
+        '--DATA_BUCKET': !Ref 'DataBucket'
+        '--REGISTRY_TABLE': !Ref 'Registry'
+        '--DATABASE_PREFIX': !Ref 'DatabasePrefix'
+        '--RELEASE_ID': !Ref 'ReleaseId'
+        # Load the Iceberg libraries used by the table writes.
+        '--datalake-formats': iceberg
+        # Use manifests and event versions for replay; do not let bookmarks skip replayed files.
+        '--job-bookmark-option': job-bookmark-disable
+        # Publish job execution metrics so operators can inspect performance in CloudWatch.
+        '--enable-metrics': 'true'
+        '--enable-observability-metrics': 'true'
+        # Put temporary Glue files in this environment's data bucket.
+        '--TempDir': !Sub 's3://${DataBucket}/temporary/'
+        # Make the shared Run helper and business checks importable by the job script.
+        '--extra-py-files': !Sub 's3://${ArtifactBucket}/releases/${ReleaseId}/glue/common.py,s3://${ArtifactBucket}/releases/${ReleaseId}/glue/contracts.py'
+        # Enable Iceberg SQL, name the Spark catalog glue_catalog, and use Glue for
+        # table metadata plus S3 for data. Use eight partitions when Spark redistributes rows.
+        '--conf': !Sub 'spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions --conf
+          spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog --conf spark.sql.catalog.glue_catalog.warehouse=s3://${DataBucket}/warehouse/
+          --conf spark.sql.catalog.glue_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog --conf spark.sql.catalog.glue_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO
+          --conf spark.sql.shuffle.partitions=8'
+
+  # 22. Creates: A Glue Spark job running silver.py.
+  # Used by: SilverTrigger starts it after Bronze succeeds.
+  # Why: Apply business rules and keep the newest accepted version of each entity.
+  SilverJob:
+    Type: AWS::Glue::Job
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    # CloudFormation owns the log groups and deletes them after the jobs.
+    DependsOn: [GlueErrorLogs, GlueOutputLogs]
+    Properties:
+      Name: !Sub '${Project}-silver'
+      Role: !GetAtt 'RuntimeRole.Arn'
+      # Use Glue 5.0 with two G.1X workers for the Spark processing.
+      GlueVersion: '5.0'
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      # Allow at most 60 minutes for this job; failed deliveries are retried through coordinator.
+      Timeout: 60
+      MaxRetries: 0
+      # Allow only one run of this job at a time, matching workflow concurrency.
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      # glueetl runs the selected Python script as a Spark job.
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Sub 's3://${ArtifactBucket}/releases/${ReleaseId}/glue/silver.py'
+      # common.Run reads these inputs to find the data, registry and Catalog databases.
+      DefaultArguments:
+        # Give this environment its own groups instead of leaving logs in shared defaults.
+        '--custom-logGroup-prefix': !Sub '/aws-glue/${Project}'
+        '--DATA_BUCKET': !Ref 'DataBucket'
+        '--REGISTRY_TABLE': !Ref 'Registry'
+        '--DATABASE_PREFIX': !Ref 'DatabasePrefix'
+        '--RELEASE_ID': !Ref 'ReleaseId'
+        # Load the Iceberg libraries used by the table writes.
+        '--datalake-formats': iceberg
+        # Use manifests and event versions for replay; do not let bookmarks skip replayed files.
+        '--job-bookmark-option': job-bookmark-disable
+        # Publish job execution metrics so operators can inspect performance in CloudWatch.
+        '--enable-metrics': 'true'
+        '--enable-observability-metrics': 'true'
+        # Put temporary Glue files in this environment's data bucket.
+        '--TempDir': !Sub 's3://${DataBucket}/temporary/'
+        # Make the shared Run helper and business checks importable by the job script.
+        '--extra-py-files': !Sub 's3://${ArtifactBucket}/releases/${ReleaseId}/glue/common.py,s3://${ArtifactBucket}/releases/${ReleaseId}/glue/contracts.py'
+        # Enable Iceberg SQL, name the Spark catalog glue_catalog, and use Glue for
+        # table metadata plus S3 for data. Use eight partitions when Spark redistributes rows.
+        '--conf': !Sub 'spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions --conf
+          spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog --conf spark.sql.catalog.glue_catalog.warehouse=s3://${DataBucket}/warehouse/
+          --conf spark.sql.catalog.glue_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog --conf spark.sql.catalog.glue_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO
+          --conf spark.sql.shuffle.partitions=8'
+
+  # 23. Creates: A Glue Spark job running gold.py.
+  # Used by: GoldTrigger starts it after Silver succeeds.
+  # Why: Check relationships, build four reports and prepare Athena views.
+  GoldJob:
+    Type: AWS::Glue::Job
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    # CloudFormation owns the log groups and deletes them after the jobs.
+    DependsOn: [GlueErrorLogs, GlueOutputLogs]
+    Properties:
+      Name: !Sub '${Project}-gold'
+      Role: !GetAtt 'RuntimeRole.Arn'
+      # Use Glue 5.0 with two G.1X workers for the Spark processing.
+      GlueVersion: '5.0'
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      # Allow at most 60 minutes for this job; failed deliveries are retried through coordinator.
+      Timeout: 60
+      MaxRetries: 0
+      # Allow only one run of this job at a time, matching workflow concurrency.
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      # glueetl runs the selected Python script as a Spark job.
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Sub 's3://${ArtifactBucket}/releases/${ReleaseId}/glue/gold.py'
+      # common.Run reads these inputs to find the data, registry and Catalog databases.
+      DefaultArguments:
+        # Give this environment its own groups instead of leaving logs in shared defaults.
+        '--custom-logGroup-prefix': !Sub '/aws-glue/${Project}'
+        '--DATA_BUCKET': !Ref 'DataBucket'
+        '--REGISTRY_TABLE': !Ref 'Registry'
+        '--DATABASE_PREFIX': !Ref 'DatabasePrefix'
+        '--RELEASE_ID': !Ref 'ReleaseId'
+        # Gold runs view-creation SQL in this workgroup after its tables exist.
+        '--ATHENA_WORKGROUP': !Ref 'Athena'
+        # Glue copies views.sql to the driver working directory for common.Run.publish_views().
+        '--extra-files': !Sub 's3://${ArtifactBucket}/releases/${ReleaseId}/sql/views.sql'
+        # Load the Iceberg libraries used by the table writes.
+        '--datalake-formats': iceberg
+        # Use manifests and event versions for replay; do not let bookmarks skip replayed files.
+        '--job-bookmark-option': job-bookmark-disable
+        # Publish job execution metrics so operators can inspect performance in CloudWatch.
+        '--enable-metrics': 'true'
+        '--enable-observability-metrics': 'true'
+        # Put temporary Glue files in this environment's data bucket.
+        '--TempDir': !Sub 's3://${DataBucket}/temporary/'
+        # Make the shared Run helper and business checks importable by the job script.
+        '--extra-py-files': !Sub 's3://${ArtifactBucket}/releases/${ReleaseId}/glue/common.py,s3://${ArtifactBucket}/releases/${ReleaseId}/glue/contracts.py'
+        # Enable Iceberg SQL, name the Spark catalog glue_catalog, and use Glue for
+        # table metadata plus S3 for data. Use eight partitions when Spark redistributes rows.
+        '--conf': !Sub 'spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions --conf
+          spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog --conf spark.sql.catalog.glue_catalog.warehouse=s3://${DataBucket}/warehouse/
+          --conf spark.sql.catalog.glue_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog --conf spark.sql.catalog.glue_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO
+          --conf spark.sql.shuffle.partitions=8'
+
+  # 24. Creates: The on-demand starting action inside the Glue workflow.
+  # Used by: Glue runs it when the coordinator starts a workflow run.
+  # Why: Start the crawler before any processing job.
+  StartTrigger:
+    Type: AWS::Glue::Trigger
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub '${Project}-start'
+      WorkflowName: !Ref 'Workflow'
+      Type: ON_DEMAND
+      Actions:
+        - CrawlerName: !Ref 'Crawler'
+
+  # 25. Creates: A rule inside the workflow: crawler success starts Bronze.
+  # Used by: Glue checks the crawler state and starts BronzeJob.
+  # Why: Ensure source schemas exist before Bronze parses the files.
+  BronzeTrigger:
+    Type: AWS::Glue::Trigger
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub '${Project}-bronze-after-crawler'
+      WorkflowName: !Ref 'Workflow'
+      Type: CONDITIONAL
+      # Activate the trigger when deployed; it still waits for the condition below.
+      StartOnCreation: true
+      # The previous action must reach SUCCEEDED in this workflow run.
+      Predicate:
+        Logical: AND
+        Conditions:
+          - CrawlerName: !Ref 'Crawler'
+            CrawlState: SUCCEEDED
+            LogicalOperator: EQUALS
+      # Start this next job after the condition is met. Quality warnings do not mark jobs failed.
+      Actions:
+        - JobName: !Ref 'BronzeJob'
+
+  # 26. Creates: A rule inside the workflow: Bronze success starts Silver.
+  # Used by: Glue checks BronzeJob and starts SilverJob.
+  # Why: Ensure accepted event history is available before entity processing.
+  SilverTrigger:
+    Type: AWS::Glue::Trigger
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub '${Project}-silver-after-bronze'
+      WorkflowName: !Ref 'Workflow'
+      Type: CONDITIONAL
+      # Activate the trigger when deployed; it still waits for the condition below.
+      StartOnCreation: true
+      # The previous action must reach SUCCEEDED in this workflow run.
+      Predicate:
+        Logical: AND
+        Conditions:
+          - JobName: !Ref 'BronzeJob'
+            State: SUCCEEDED
+            LogicalOperator: EQUALS
+      # Start this next job after the condition is met. Quality warnings do not mark jobs failed.
+      Actions:
+        - JobName: !Ref 'SilverJob'
+
+  # 27. Creates: A rule inside the workflow: Silver success starts Gold.
+  # Used by: Glue checks SilverJob and starts GoldJob.
+  # Why: Build reports only after the entity updates finish.
+  GoldTrigger:
+    Type: AWS::Glue::Trigger
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub '${Project}-gold-after-silver'
+      WorkflowName: !Ref 'Workflow'
+      Type: CONDITIONAL
+      # Activate the trigger when deployed; it still waits for the condition below.
+      StartOnCreation: true
+      # The previous action must reach SUCCEEDED in this workflow run.
+      Predicate:
+        Logical: AND
+        Conditions:
+          - JobName: !Ref 'SilverJob'
+            State: SUCCEEDED
+            LogicalOperator: EQUALS
+      # Start this next job after the condition is met. Quality warnings do not mark jobs failed.
+      Actions:
+        - JobName: !Ref 'GoldJob'
+
+  # 28. Creates: A CloudWatch alarm for messages in the dead-letter queue.
+  # Used by: CloudWatch checks the queue metric and publishes to Alerts.
+  # Why: Notify operators when at least one failed message needs attention.
+  DeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      AlarmName: !Sub '${Project}-deadletter'
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      # Select the specific queue/function to monitor, rather than an account-wide metric.
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt 'DeadLetters.QueueName'
+      Statistic: Maximum
+      # Evaluate one five-minute window; compare its metric with Threshold below.
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      # A missing metric is not itself an alarm; notify SNS when the threshold is breached.
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref 'Alerts']
+
+  # 29. Creates: A CloudWatch alarm for an intake message waiting 15 minutes.
+  # Used by: CloudWatch checks message age and publishes to Alerts.
+  # Why: Detect delayed intake; this does not measure total Glue processing time.
+  BacklogAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      AlarmName: !Sub '${Project}-backlog'
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      # Select the specific queue/function to monitor, rather than an account-wide metric.
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt 'IntakeQueue.QueueName'
+      Statistic: Maximum
+      # Evaluate one five-minute window; compare its metric with Threshold below.
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 900
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      # A missing metric is not itself an alarm; notify SNS when the threshold is breached.
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref 'Alerts']
+
+  # 30. Creates: A CloudWatch log group for the intake Lambda.
+  # Used by: Intake writes logs; operators read them when a manifest fails.
+  # Why: Keep diagnostics for 30 days, then let CloudWatch expire them.
+  IntakeLogs:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${Project}-intake'
+      RetentionInDays: 30
+
+  # 31. Creates: A CloudWatch alarm for intake Lambda invocation errors.
+  # Used by: CloudWatch evaluates a five-minute error count and publishes to Alerts.
+  # Why: Notify operators when an invocation ends with an error.
+  IntakeErrors:
+    Type: AWS::CloudWatch::Alarm
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      AlarmName: !Sub '${Project}-intake-errors'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      # Select the specific queue/function to monitor, rather than an account-wide metric.
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref 'Intake'
+      Statistic: Sum
+      # Evaluate one five-minute window; compare its metric with Threshold below.
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      # A missing metric is not itself an alarm; notify SNS when the threshold is breached.
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref 'Alerts']
+
+  # 32. Creates: A CloudWatch log group for the coordinator Lambda.
+  # Used by: Coordinator writes logs; operators inspect dispatch/recovery decisions.
+  # Why: Keep diagnostics for 30 days.
+  CoordinatorLogs:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${Project}-coordinator'
+      RetentionInDays: 30
+
+  # 33. Creates: A CloudWatch alarm for coordinator invocation errors.
+  # Used by: CloudWatch evaluates a five-minute error count and publishes to Alerts.
+  # Why: Detect failures that could stop the next delivery from starting.
+  CoordinatorErrors:
+    Type: AWS::CloudWatch::Alarm
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      AlarmName: !Sub '${Project}-coordinator-errors'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      # Select the specific queue/function to monitor, rather than an account-wide metric.
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref 'Coordinator'
+      Statistic: Sum
+      # Evaluate one five-minute window; compare its metric with Threshold below.
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      # A missing metric is not itself an alarm; notify SNS when the threshold is breached.
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref 'Alerts']
+
+  # 34. Creates: A CloudWatch dashboard with queue and Lambda charts.
+  # Used by: Operators inspecting this environment in the AWS Console.
+  # Why: See message backlog and invocation failures in one place.
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DashboardName: !Sub '${Project}-operations'
+      # The JSON defines two charts and a text note. An empty queue does not prove
+      # Gold publication succeeded; the note directs readers to DynamoDB and quality evidence.
+      DashboardBody: !Sub |
+        {"widgets": [{"type": "metric", "x": 0, "y": 0, "width": 12, "height": 6, "properties": {"title": "Intake backlog and dead letters", "region": "${AWS::Region}", "metrics": [["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${Project}-intake"], ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${Project}-dlq"]], "stat": "Maximum", "period": 300}}, {"type": "metric", "x": 12, "y": 0, "width": 12, "height": 6, "properties": {"title": "Lambda failures", "region": "${AWS::Region}", "metrics": [["AWS/Lambda", "Errors", "FunctionName", "${Project}-intake"], ["AWS/Lambda", "Errors", "FunctionName", "${Project}-coordinator"]], "stat": "Sum", "period": 300}}, {"type": "text", "x": 0, "y": 6, "width": 24, "height": 3, "properties": {"markdown": "Operational state: DynamoDB `${Project}-registry`. Crawler/job states: batch execution_steps. Quality results: S3 quality/ and quarantine/. A zero SQS backlog does not imply successful publication; inspect the registry and published version."}}]}
+
+
+  # 35. Creates: A dedicated group for Glue system/error logs.
+  # Used by: All three Glue jobs through --custom-logGroup-prefix.
+  # Why: Delete this environment's logs with the stack without touching another project's logs.
+  GlueErrorLogs:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws-glue/${Project}/error'
+      RetentionInDays: 30
+
+  # 36. Creates: A dedicated group for Glue stdout/stderr output.
+  # Used by: All three Glue jobs through the same custom prefix.
+  # Why: Keep processing diagnostics under the platform stack's deletion lifecycle.
+  GlueOutputLogs:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws-glue/${Project}/output'
+      RetentionInDays: 30
+
+  # 37. Creates: A callback that runs before deleting the processing resources.
+  # Used by: CloudFormation calls the bootstrap cleanup helper.
+  # Why: Pause new deliveries, require idle Glue runs, disable registry recovery,
+  # and remove this crawler's/older jobs' streams from shared AWS log groups.
+  PlatformCleanup:
+    Type: Custom::EnvironmentCleanup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    # Create this last, delete it first. A failed check leaves processing resources intact.
+    DependsOn:
+      - Registry
+      - Alerts
+      - DeadLetters
+      - IntakeQueue
+      - ManifestRule
+      - QueuePolicy
+      - RuntimeRole
+      - Intake
+      - IntakeMapping
+      - Coordinator
+      - SchedulerRole
+      - DispatchSchedule
+      - Workflow
+      - Athena
+      - Crawler
+      - RawDatabase
+      - BronzeDatabase
+      - SilverDatabase
+      - GoldDatabase
+      - BronzeJob
+      - SilverJob
+      - GoldJob
+      - StartTrigger
+      - BronzeTrigger
+      - SilverTrigger
+      - GoldTrigger
+      - DeadLetterAlarm
+      - BacklogAlarm
+      - IntakeLogs
+      - IntakeErrors
+      - CoordinatorLogs
+      - CoordinatorErrors
+      - Dashboard
+      - GlueErrorLogs
+      - GlueOutputLogs
+    Properties:
+      ServiceToken:
+        Fn::ImportValue: !Sub '${Project}-cleanup-service-token'
+      ServiceTimeout: 900
+      Mode: Platform
+      # This import also prevents deletion of foundation while platform still exists.
+      Bucket:
+        Fn::ImportValue: !Sub '${Project}-data-bucket'
+
+# Show these values in the stack Outputs tab for inspection and downstream use.
+Outputs:
+  RegistryTable:
+    Value: !Ref 'Registry'
+  WorkflowName:
+    Value: !Ref 'Workflow'
+  CoordinatorFunction:
+    Value: !Ref 'Coordinator'
+  IntakeFunction:
+    Value: !Ref 'Intake'
+  AlertsTopic:
+    Value: !Ref 'Alerts'
+  AthenaWorkgroup:
+    Value: !Ref 'Athena'
+  DeadLetterQueue:
+    Value: !Ref 'DeadLetters'
+  DataBucketName:
+    Value: !Ref 'DataBucket'
+  DeployedRelease:
+    Value: !Ref 'ReleaseId'

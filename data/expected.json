@@ -1,0 +1,23 @@
+{
+  "synthetic": true,
+  "business_events": 100000,
+  "reference_events": 6600,
+  "duplicate_rows": 500,
+  "input_rows": 107100,
+  "bronze_unique_events": 106600,
+  "silver_counts": {
+    "payment": 10000,
+    "shipment": 12000,
+    "order_item": 20000,
+    "return": 3000,
+    "refund": 3000,
+    "product": 600,
+    "customer": 6000
+  },
+  "order_count": 10000,
+  "captured_paise": 2945788600,
+  "refunded_paise": 535863300,
+  "net_collected_paise": 2409925300,
+  "booked_value_paise": 3359610300,
+  "description": "Fictional customers, sellers and transactions. Real Indian city and carrier names provide geographic and operational context. Source event time spans September; one initial delivery contains the history."
+}

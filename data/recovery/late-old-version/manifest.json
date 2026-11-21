@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "delivery_name": "late-old-version",
+  "mode": "REPLAY",
+  "files": [
+    {
+      "entity": "order_item",
+      "path": "order_item/2621d589c3b7f64b8d7c4df7aa163ba7b28e544e3237ed7226ba6c9ff437e354.jsonl",
+      "rows": 1,
+      "sha256": "2621d589c3b7f64b8d7c4df7aa163ba7b28e544e3237ed7226ba6c9ff437e354"
+    }
+  ]
+}

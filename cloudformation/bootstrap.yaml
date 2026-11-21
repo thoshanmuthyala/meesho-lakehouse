@@ -1,0 +1,968 @@
+# Create the CI/CD setup once per environment in the CloudFormation Console.
+# Choose us-east-1. Enter dev or prod, the GitHub repository, and its connection ARN.
+# This stack creates the pipeline and the permissions it needs to deploy the project.
+# After a Git push, that pipeline deploys foundation.yaml and platform.yaml.
+#
+# Reading this file: Parameters are inputs; Resources are things AWS creates;
+# Outputs are values shown on the completed stack. Resource names such as
+# ArtifactBucket are labels inside this file; Properties sets their AWS settings.
+# !Ref reads an input or resource ID; !GetAtt reads a resource attribute such as ARN.
+# An ARN is a full AWS resource identifier. !Sub fills ${...} placeholders.
+# AWS::AccountId and AWS::Region come from the account and Region used to deploy.
+# CloudFormation follows resource dependencies, not the written order of the file.
+
+# DeletionPolicy: Delete removes the resource when its stack is deleted.
+# UpdateReplacePolicy: Delete removes the old resource if an update replaces it.
+# Normal in-place updates keep existing data; deleting storage permanently removes it.
+# Delete stacks in this order: platform, foundation, bootstrap (see RUNBOOK.md).
+#
+# CloudFormation template syntax version; keep this value when editing the project.
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Meesho one-time GitHub CI/CD bootstrap for dev or prod.
+
+# Inputs: enter these values in the CloudFormation Console.
+Parameters:
+  # Choose dev or prod; this controls names, branch selection and approval.
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, prod]
+    Description: dev watches GitHub dev; prod watches GitHub main.
+  # Enter owner/repository, for example your-name/meesho-lakehouse; omit the URL.
+  Repository:
+    Type: String
+    AllowedPattern: '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+'
+    Description: GitHub owner/repository, with the project files at repository root.
+  # Paste the ARN of the already-authorized GitHub connection in us-east-1.
+  ConnectionArn:
+    Type: String
+    Description: ARN of the AVAILABLE GitHub connection in this AWS Region.
+
+# Decide whether an optional part of this stack should be included.
+Conditions:
+  # True for prod: select main and include manual release approval.
+  IsProduction: !Equals [!Ref 'Environment', prod]
+
+# Create the resources below and connect them through their references.
+Resources:
+  # 1. Creates: A KMS key for encrypting this environment's S3 files.
+  # Used by: S3, CodePipeline, CodeBuild and the processing services.
+  # Why: The artifact bucket and later data bucket need encryption.
+  DataKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: !Sub 'meesho-${Environment} lakehouse encryption'
+      # Rotate key material automatically; existing encrypted files remain readable.
+      EnableKeyRotation: true
+      # AWS requires 7-30 days before key destruction; use the shortest allowed wait.
+      PendingWindowInDays: 7
+      # Allow this account to grant key access through IAM roles.
+      # The root ARN identifies the account; callers still need their own permissions.
+      KeyPolicy:
+        # IAM policy syntax version; keep this value when changing permissions.
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+
+  # 2. Creates: A readable name such as alias/meesho-dev for the KMS key.
+  # Used by: People inspecting encryption settings in the AWS Console.
+  # Why: The key is easier to identify than its generated ID.
+  KeyAlias:
+    Type: AWS::KMS::Alias
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      AliasName: !Sub 'alias/meesho-${Environment}'
+      TargetKeyId: !Ref 'DataKey'
+
+  # 3. Creates: An S3 bucket for source ZIPs and packaged code releases.
+  # Used by: CodePipeline passes source here; CodeBuild uploads Lambda/Glue code.
+  # Why: Deployment services need a shared place to read the selected release.
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      # Add account and Region to the environment prefix for a distinct bucket name.
+      BucketName: !Sub 'meesho-${Environment}-artifacts-${AWS::AccountId}-${AWS::Region}'
+      # Keep an S3 version ID for each saved object version.
+      VersioningConfiguration:
+        Status: Enabled
+      # Prevent public bucket/object access; approved IAM identities still have access.
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # Encrypt new files with the supplied KMS key. Bucket keys reduce KMS requests.
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !GetAtt 'DataKey.Arn'
+            BucketKeyEnabled: true
+
+  # 4. Creates: An access rule attached to the artifact bucket.
+  # Used by: S3 checks this rule whenever a client accesses that bucket.
+  # Why: Reject unencrypted HTTP requests; require HTTPS.
+  ArtifactPolicy:
+    Type: AWS::S3::BucketPolicy
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Bucket: !Ref 'ArtifactBucket'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Reject this request when the Condition below is true; Principal: * means any caller.
+          - Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: [!GetAtt 'ArtifactBucket.Arn', !Sub '${ArtifactBucket.Arn}/*']
+            Condition:
+              Bool:
+                # HTTP matches this deny rule; HTTPS does not match it.
+                'aws:SecureTransport': 'false'
+
+  # 5. Creates: The IAM role named meesho-<environment>-cloudformation.
+  # Used by: CloudFormation when CodeBuild asks it to deploy application stacks.
+  # Why: Give CloudFormation permission to create the bucket and runtime services.
+  DeploymentRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RoleName: !Sub 'meesho-${Environment}-cloudformation'
+      # Trust policy: name the AWS service allowed to use this role.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      # Permission policy: Action says what is allowed; Resource says where.
+      # Effect: Allow grants the listed operations to the service using this role.
+      Policies:
+        - PolicyName: platform-resources
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # CloudFormation creates/updates the data bucket and its access policy.
+              - Effect: Allow
+                Action: 's3:*'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::meesho-${Environment}-data-${AWS::AccountId}-${AWS::Region}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::meesho-${Environment}-data-${AWS::AccountId}-${AWS::Region}/*'
+              # CloudFormation creates runtime roles and assigns them to Lambda/Glue/Scheduler.
+              - Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:GetRole
+                  - iam:DeleteRole
+                  - iam:PutRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:PassRole
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/meesho-${Environment}-*'
+              # CloudFormation creates/updates this environment's Lambda functions.
+              - Effect: Allow
+                Action: 'lambda:*'
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:meesho-${Environment}-*'
+              # CloudFormation manages the SQS-to-Lambda connection; these APIs use broad scope.
+              - Effect: Allow
+                Action:
+                  - lambda:CreateEventSourceMapping
+                  - lambda:GetEventSourceMapping
+                  - lambda:UpdateEventSourceMapping
+                  - lambda:DeleteEventSourceMapping
+                  - lambda:ListEventSourceMappings
+                  - lambda:TagResource
+                  - lambda:UntagResource
+                  - lambda:ListTags
+                Resource: '*'
+              # CloudFormation creates/updates the delivery registry in DynamoDB.
+              - Effect: Allow
+                Action: 'dynamodb:*'
+                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/meesho-${Environment}-*'
+              # CloudFormation creates Glue databases, crawler, jobs, workflow and triggers.
+              # Deleting a database also requires access to its child tables and functions.
+              - Effect: Allow
+                Action: 'glue:*'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/meesho_${Environment}_*'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/meesho_${Environment}_*/*'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:userDefinedFunction/meesho_${Environment}_*/*'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/meesho-${Environment}-*'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:workflow/meesho-${Environment}-*'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:trigger/meesho-${Environment}-*'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:crawler/meesho-${Environment}-*'
+              # CloudFormation creates/updates the intake queue and dead-letter queue.
+              - Effect: Allow
+                Action: 'sqs:*'
+                Resource: !Sub 'arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:meesho-${Environment}-*'
+              # CloudFormation creates the alert topic and optional email subscription.
+              - Effect: Allow
+                Action: 'sns:*'
+                Resource: !Sub 'arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:meesho-${Environment}-*'
+              # CloudFormation creates the rule that routes S3 manifest events to SQS.
+              - Effect: Allow
+                Action: 'events:*'
+                Resource: !Sub 'arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/meesho-${Environment}-*'
+              # CloudFormation creates the five-minute coordinator schedule.
+              - Effect: Allow
+                Action: 'scheduler:*'
+                Resource: !Sub 'arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/default/meesho-${Environment}-*'
+              # CloudFormation creates the Athena query workgroup.
+              - Effect: Allow
+                Action: 'athena:*'
+                Resource: !Sub 'arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:workgroup/meesho-${Environment}-*'
+              # CloudFormation creates Lambda/Glue log groups and sets their retention.
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:DeleteLogGroup
+                  - logs:PutRetentionPolicy
+                  - logs:DeleteRetentionPolicy
+                  - logs:TagResource
+                  - logs:UntagResource
+                  - logs:ListTagsForResource
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/meesho-${Environment}-*'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/meesho-${Environment}/*'
+              # CloudFormation looks up existing log groups; this listing API uses Resource: *.
+              - Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource: '*'
+              # CloudFormation creates/updates alarms for queues and Lambda errors.
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricAlarm
+                  - cloudwatch:DeleteAlarms
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:TagResource
+                  - cloudwatch:UntagResource
+                  - cloudwatch:ListTagsForResource
+                Resource: !Sub 'arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:meesho-${Environment}-*'
+              # CloudFormation reads the packaged code when configuring Lambda functions.
+              - Effect: Allow
+                Action: ['s3:GetObject', 's3:GetObjectVersion']
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/releases/*'
+              # CloudFormation can decrypt the packaged code in the artifact bucket.
+              - Effect: Allow
+                Action: ['kms:Decrypt', 'kms:DescribeKey']
+                Resource: !GetAtt 'DataKey.Arn'
+              # CloudFormation creates/updates the operations dashboard.
+              - Effect: Allow
+                Action: ['cloudwatch:PutDashboard', 'cloudwatch:GetDashboard', 'cloudwatch:DeleteDashboards']
+                Resource: !Sub 'arn:${AWS::Partition}:cloudwatch::${AWS::AccountId}:dashboard/meesho-${Environment}-*'
+
+  # 6. Creates: The IAM role for the validation build.
+  # Used by: The Validate CodeBuild project defined later in this file.
+  # Why: Tests need source files and logs, but no resource-deployment permissions.
+  ValidationRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RoleName: !Sub 'meesho-${Environment}-validation'
+      # Trust policy: name the AWS service allowed to use this role.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      # Permission policy: Action says what is allowed; Resource says where.
+      # Effect: Allow grants the listed operations to the service using this role.
+      Policies:
+        - PolicyName: validate-source
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # The validation build writes its command output to CloudWatch Logs.
+              - Effect: Allow
+                Action: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents']
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/meesho-${Environment}-validate*'
+              # The validation build reads the source ZIP supplied by CodePipeline.
+              - Effect: Allow
+                Action: ['s3:GetObject', 's3:GetObjectVersion']
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/*'
+              # The validation build can list its artifact bucket and check its Region.
+              - Effect: Allow
+                Action: ['s3:GetBucketLocation', 's3:ListBucket']
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucket}'
+              # The validation build decrypts its source ZIP with this environment's key.
+              - Effect: Allow
+                Action: ['kms:Decrypt', 'kms:DescribeKey']
+                Resource: !GetAtt 'DataKey.Arn'
+
+  # 7. Creates: The IAM role for the deployment build.
+  # Used by: The Deploy CodeBuild project and its ops/deploy.py script.
+  # Why: Upload code, request stack changes, and pause/resume data processing.
+  BuildRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RoleName: !Sub 'meesho-${Environment}-build'
+      # Trust policy: name the AWS service allowed to use this role.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      # Permission policy: Action says what is allowed; Resource says where.
+      # Effect: Allow grants the listed operations to the service using this role.
+      Policies:
+        - PolicyName: delivery
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # The deployment build writes its progress and errors to CloudWatch Logs.
+              - Effect: Allow
+                Action: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents']
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/meesho-${Environment}-*'
+              # The deployment build reads source and uploads versioned Lambda/Glue/SQL files.
+              - Effect: Allow
+                Action: ['s3:GetObject', 's3:GetObjectVersion', 's3:PutObject']
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/*'
+              # The deployment build can list its artifact bucket and check its Region.
+              - Effect: Allow
+                Action: ['s3:GetBucketLocation', 's3:ListBucket']
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucket}'
+              # The deployment build reads/writes artifacts encrypted with this key.
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource: !GetAtt 'DataKey.Arn'
+              # The deployment build requests, inspects and applies foundation/platform changes.
+              # A change set is CloudFormation's list of proposed resource changes.
+              - Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/meesho-${Environment}-foundation/*'
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/meesho-${Environment}-platform/*'
+              # The deployment build inspects template inputs before a new stack exists.
+              # This read-only template API uses Resource: * rather than a stack ARN.
+              - Effect: Allow
+                Action: cloudformation:GetTemplateSummary
+                Resource: '*'
+              # PassRole lets the build assign DeploymentRole to CloudFormation and the
+              # scheduler role to Scheduler. It does not let the build assume those roles.
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: [!GetAtt 'DeploymentRole.Arn', !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/meesho-${Environment}-scheduler']
+              # ops/deploy.py pauses and resumes only this environment's schedule.
+              - Effect: Allow
+                Action: ['scheduler:GetSchedule', 'scheduler:UpdateSchedule']
+                Resource: !Sub 'arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/default/meesho-${Environment}-dispatch'
+              # ops/deploy.py reads the workflow claim to wait for an active delivery to finish.
+              - Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/meesho-${Environment}-registry'
+              # ops/deploy.py invokes coordinator to pause admissions, check runs and resume.
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:meesho-${Environment}-coordinator'
+              # ops/deploy.py reads the Glue workflow graph to check deployment readiness.
+              - Effect: Allow
+                Action: glue:GetWorkflow
+                Resource: !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:workflow/meesho-${Environment}-workflow'
+
+  # 8. Creates: The IAM role for CodePipeline.
+  # Used by: The Pipeline resource defined later in this file.
+  # Why: Fetch GitHub source and start/check the two CodeBuild projects.
+  PipelineRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RoleName: !Sub 'meesho-${Environment}-pipeline'
+      # Trust policy: name the AWS service allowed to use this role.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      # Permission policy: Action says what is allowed; Resource says where.
+      # Effect: Allow grants the listed operations to the service using this role.
+      Policies:
+        - PolicyName: pipeline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # CodePipeline uses the authorized connection to fetch the selected GitHub commit.
+              - Effect: Allow
+                Action: ['codeconnections:UseConnection', 'codestar-connections:UseConnection']
+                Resource: !Ref 'ConnectionArn'
+              # CodePipeline stores source artifacts and passes them to build stages.
+              - Effect: Allow
+                Action: ['s3:GetObject', 's3:GetObjectVersion', 's3:PutObject']
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/*'
+              # CodePipeline checks artifact-bucket versioning and location.
+              - Effect: Allow
+                Action: ['s3:GetBucketVersioning', 's3:GetBucketLocation']
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucket}'
+              # CodePipeline encrypts/decrypts artifacts using this environment's key.
+              - Effect: Allow
+                Action: ['kms:Decrypt', 'kms:Encrypt', 'kms:GenerateDataKey']
+                Resource: !GetAtt 'DataKey.Arn'
+              # CodePipeline starts the two build projects and waits for their results.
+              - Effect: Allow
+                Action: ['codebuild:StartBuild', 'codebuild:BatchGetBuilds']
+                Resource: [!GetAtt 'Validate.Arn', !GetAtt 'Deploy.Arn']
+
+  # 9. Creates: A CodeBuild project named meesho-<environment>-validate.
+  # Used by: CodePipeline's Validate stage.
+  # Why: Run tests and template checks before allowing deployment.
+  Validate:
+    Type: AWS::CodeBuild::Project
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub 'meesho-${Environment}-validate'
+      # CodeBuild uses this role while running the commands in its buildspec file.
+      ServiceRole: !GetAtt 'ValidationRole.Arn'
+      # Let CodePipeline manage the artifact hand-off for this build project.
+      Artifacts:
+        Type: CODEPIPELINE
+      # Receive the source ZIP from CodePipeline; read the named buildspec inside it.
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec-check.yml
+      # Run commands in an AWS-managed Linux container with the selected build tools.
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        Type: LINUX_CONTAINER
+        # Supply these values to the build automatically; no terminal exports are needed.
+        EnvironmentVariables:
+          # ops/environment.py checks these target names against config/dev.yaml or prod.yaml.
+          - Name: TARGET_ENVIRONMENT
+            Value: !Ref 'Environment'
+          - Name: PROJECT
+            Value: !Sub 'meesho-${Environment}'
+          - Name: DATABASE_PREFIX
+            Value: !Sub 'meesho_${Environment}'
+
+  # 10. Creates: A CodeBuild project named meesho-<environment>-deploy.
+  # Used by: CodePipeline's Deploy stage after checks and any approval.
+  # Why: Run ops/deploy.py to create/update foundation and platform resources.
+  Deploy:
+    Type: AWS::CodeBuild::Project
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub 'meesho-${Environment}-deploy'
+      # Allow time to finish an active data run and then deploy both application stacks.
+      TimeoutInMinutes: 120
+      # CodeBuild uses this role while running the commands in its buildspec file.
+      ServiceRole: !GetAtt 'BuildRole.Arn'
+      # Let CodePipeline manage the artifact hand-off for this build project.
+      Artifacts:
+        Type: CODEPIPELINE
+      # Receive the source ZIP from CodePipeline; read the named buildspec inside it.
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec.yml
+      # Run commands in an AWS-managed Linux container with the selected build tools.
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        Type: LINUX_CONTAINER
+        # Supply these values to the build automatically; no terminal exports are needed.
+        EnvironmentVariables:
+          # ops/environment.py checks these target names against config/dev.yaml or prod.yaml.
+          - Name: TARGET_ENVIRONMENT
+            Value: !Ref 'Environment'
+          - Name: PROJECT
+            Value: !Sub 'meesho-${Environment}'
+          - Name: DATABASE_PREFIX
+            Value: !Sub 'meesho_${Environment}'
+          # ops/deploy.py uses the bucket/key/role created earlier in this bootstrap.
+          - Name: ARTIFACT_BUCKET
+            Value: !Ref 'ArtifactBucket'
+          - Name: KEY_ARN
+            Value: !GetAtt 'DataKey.Arn'
+          - Name: DEPLOYMENT_ROLE_ARN
+            Value: !GetAtt 'DeploymentRole.Arn'
+
+  # 11. Creates: The release workflow named meesho-<environment>-delivery.
+  # Used by: Developers pushing to dev or merging reviewed changes into main.
+  # Why: Run Source -> Validate -> optional approval -> Deploy automatically.
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub 'meesho-${Environment}-delivery'
+      RoleArn: !GetAtt 'PipelineRole.Arn'
+      PipelineType: V2
+      # Queue new releases while this pipeline is busy; do not overlap deployments.
+      ExecutionMode: QUEUED
+      # Store the captured source ZIP here so both builds receive the same revision.
+      ArtifactStore:
+        Type: S3
+        Location: !Ref 'ArtifactBucket'
+        EncryptionKey:
+          Id: !GetAtt 'DataKey.Arn'
+          Type: KMS
+      Stages:
+        # Stage 1: fetch a GitHub commit and name its source artifact Source.
+        - Name: Source
+          Actions:
+            - Name: GitHub
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                # AWS uses this provider name for GitHub sources connected through CodeConnections.
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              # Expose this commit's BranchName and CommitId to later pipeline actions.
+              Namespace: SourceRevision
+              Configuration:
+                ConnectionArn: !Ref 'ConnectionArn'
+                FullRepositoryId: !Ref 'Repository'
+                # !If chooses main for prod and dev otherwise; this pipeline watches one branch.
+                BranchName: !If [IsProduction, main, dev]
+                # Start a release when the watched branch changes. Protect main in GitHub for reviews.
+                DetectChanges: 'true'
+              OutputArtifacts:
+                - Name: Source
+        # Stage 2: start the validation build. A failed check stops deployment.
+        - Name: Validate
+          Actions:
+            - Name: Validate
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref 'Validate'
+                # Pass the actual source branch to CodeBuild so it can check the target environment.
+                EnvironmentVariables: '[{"name":"SOURCE_BRANCH","value":"#{SourceRevision.BranchName}","type":"PLAINTEXT"}]'
+              InputArtifacts:
+                - Name: Source
+        # Production only: pause here for a person to approve the captured release.
+        - !If
+          - IsProduction
+          - Name: Approve
+            Actions:
+              - Name: ApproveProductionRelease
+                ActionTypeId:
+                  Category: Approval
+                  Owner: AWS
+                  Provider: Manual
+                  Version: '1'
+                Configuration:
+                  CustomData: 'Production release: review main commit #{SourceRevision.CommitId}, the promoted changes and the corresponding successful dev execution.'
+          # For dev, remove the whole approval stage from the pipeline.
+          - !Ref 'AWS::NoValue'
+        # Final stage: start the deployment build using the same Source artifact.
+        # The build deploys resources; business data is uploaded separately afterwards.
+        - Name: Deploy
+          Actions:
+            - Name: DeployPlatform
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref 'Deploy'
+                # Pass the actual source branch to CodeBuild so it can check the target environment.
+                EnvironmentVariables: '[{"name":"SOURCE_BRANCH","value":"#{SourceRevision.BranchName}","type":"PLAINTEXT"}]'
+              InputArtifacts:
+                - Name: Source
+
+
+  # 12. Creates: The execution role for the stack-deletion helper.
+  # Used by: CleanupFunction, only when CloudFormation calls a custom resource.
+  # Why: Empty this environment's buckets and remove generated logs/build history.
+  CleanupRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RoleName: !Sub 'meesho-${Environment}-cleanup'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: environment-deletion
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Purge only the two known buckets. No KMS decryption is needed to delete files.
+              - Effect: Allow
+                Action: ['s3:ListBucketVersions', 's3:ListBucketMultipartUploads', 's3:GetBucketPolicy', 's3:PutBucketPolicy']
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::meesho-${Environment}-data-${AWS::AccountId}-${AWS::Region}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::meesho-${Environment}-artifacts-${AWS::AccountId}-${AWS::Region}'
+              - Effect: Allow
+                Action: ['s3:DeleteObjectVersion', 's3:AbortMultipartUpload']
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::meesho-${Environment}-data-${AWS::AccountId}-${AWS::Region}/*'
+                  - !Sub 'arn:${AWS::Partition}:s3:::meesho-${Environment}-artifacts-${AWS::AccountId}-${AWS::Region}/*'
+              # Confirm an actual stack deletion, so a failed update cannot purge existing data.
+              - Effect: Allow
+                Action: cloudformation:DescribeStacks
+                Resource:
+                  - !Ref 'AWS::StackId'
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/meesho-${Environment}-foundation/*'
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/meesho-${Environment}-platform/*'
+              # Pause new deliveries through the coordinator's existing maintenance action.
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:meesho-${Environment}-coordinator'
+              # Read execution state and exact log ownership before allowing platform deletion.
+              - Effect: Allow
+                Action: ['glue:GetWorkflowRuns', 'glue:GetJobRuns', 'glue:GetCrawler', 'glue:ListCrawls']
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:workflow/meesho-${Environment}-workflow'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/meesho-${Environment}-*'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:crawler/meesho-${Environment}-raw-discovery'
+              # Turn off recovery immediately before deletion, avoiding a final system backup.
+              - Effect: Allow
+                Action: ['dynamodb:UpdateContinuousBackups', 'dynamodb:DescribeContinuousBackups']
+                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/meesho-${Environment}-registry'
+              # CodeBuild does not remove old builds or their log groups when a project is deleted.
+              - Effect: Allow
+                Action: ['codebuild:ListBuildsForProject', 'codebuild:BatchGetBuilds', 'codebuild:BatchDeleteBuilds']
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:project/meesho-${Environment}-validate'
+                  - !Sub 'arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:project/meesho-${Environment}-deploy'
+              - Effect: Allow
+                Action: logs:DeleteLogGroup
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/meesho-${Environment}-validate:*'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/meesho-${Environment}-deploy:*'
+              # AWS shares these groups across projects. Code deletes only streams identified
+              # by this crawler's history or this environment's exact Glue job run IDs.
+              - Effect: Allow
+                Action: ['logs:DescribeLogStreams', 'logs:DeleteLogStream']
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/crawlers:*'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/jobs/error:*'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/jobs/output:*'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/jobs/logs-v2:*'
+              # Save the helper's own diagnostics in a group owned by this bootstrap stack.
+              - Effect: Allow
+                Action: ['logs:CreateLogStream', 'logs:PutLogEvents']
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/meesho-${Environment}-cleanup:*'
+
+  # 13. Creates: The cleanup helper's CloudWatch log group.
+  # Used by: CleanupFunction; operators inspect it if stack deletion fails.
+  # Why: CloudFormation removes these logs too, after the helper has finished.
+  CleanupLogs:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/meesho-${Environment}-cleanup'
+      RetentionInDays: 7
+
+  # 14. Creates: A Lambda used only for CloudFormation lifecycle requests.
+  # Used by: The cleanup custom resource in each of the three environment stacks.
+  # Why: CloudFormation cannot empty S3 buckets or remove service-created log streams itself.
+  # This is infrastructure cleanup; it is not part of delivery processing or audit.
+  CleanupFunction:
+    Type: AWS::Lambda::Function
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    # Create logs first; on deletion, remove the function before deleting its logs.
+    DependsOn: CleanupLogs
+    Properties:
+      FunctionName: !Sub 'meesho-${Environment}-cleanup'
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt 'CleanupRole.Arn'
+      Timeout: 900
+      MemorySize: 256
+      Environment:
+        Variables:
+          PROJECT: !Sub 'meesho-${Environment}'
+          ACCOUNT: !Ref 'AWS::AccountId'
+      # Inline code keeps bootstrap upload self-contained: no pre-uploaded ZIP is required.
+      Code:
+        ZipFile: |
+          """CloudFormation deletion helper; normal Create/Update calls leave data alone.
+
+          This code stays inside bootstrap.yaml so Console setup needs only that file.
+          The same helper serves this environment's three stacks, never the other one.
+          """
+          import json
+          import os
+          import time
+
+          import boto3
+          import cfnresponse
+          from botocore.config import Config
+          from botocore.exceptions import ClientError
+
+          PROJECT = os.environ["PROJECT"]
+          ACCOUNT = os.environ["ACCOUNT"]
+          REGION = os.environ["AWS_REGION"]
+          # Short API timeouts leave time to report failure back to CloudFormation.
+          CONFIG = Config(connect_timeout=5, read_timeout=15, retries={"max_attempts": 3})
+
+
+          def client(service):
+              return boto3.client(service, config=CONFIG)
+
+
+          def check_time(context):
+              # A failed deletion can be retried; do not silently abandon an incomplete purge.
+              if context.get_remaining_time_in_millis() < 60000:
+                  raise TimeoutError("Cleanup needs another attempt. Retry Delete on this stack.")
+
+
+          def pages(method, context, token_key="NextToken", **arguments):
+              """Read every API page, including lower-case nextToken used by Logs/CodeBuild."""
+              while True:
+                  check_time(context)
+                  page = method(**arguments)
+                  yield page
+                  token = page.get(token_key)
+                  if not token:
+                      return
+                  arguments[token_key] = token
+
+
+          def allow_missing(method, **arguments):
+              """An already-deleted resource is harmless; access/other errors must stop deletion."""
+              try:
+                  return method(**arguments)
+              except ClientError as error:
+                  if error.response["Error"]["Code"] not in {
+                      "NoSuchBucket", "NoSuchUpload", "ResourceNotFoundException",
+                      "EntityNotFoundException",
+                  }:
+                      raise
+                  return {}
+
+
+          def empty_bucket(bucket, context):
+              """Block new writes, abort unfinished uploads, then delete ALL object versions."""
+              allowed = {f"{PROJECT}-{kind}-{ACCOUNT}-{REGION}" for kind in ("data", "artifacts")}
+              if bucket not in allowed:
+                  raise ValueError("Refusing to empty a bucket outside this environment.")
+              s3 = client("s3")
+              try:
+                  # Keep existing HTTPS/landing rules; add a temporary deletion-time write block.
+                  policy = json.loads(s3.get_bucket_policy(Bucket=bucket)["Policy"])
+              except ClientError as error:
+                  code = error.response["Error"]["Code"]
+                  if code == "NoSuchBucket":
+                      return
+                  if code != "NoSuchBucketPolicy":
+                      raise
+                  policy = {"Version": "2012-10-17", "Statement": []}
+              statements = policy["Statement"]
+              if not any(item.get("Sid") == "BlockWritesDuringDeletion" for item in statements):
+                  statements.append({"Sid": "BlockWritesDuringDeletion", "Effect": "Deny",
+                                     "Principal": "*", "Action": "s3:PutObject",
+                                     "Resource": f"arn:aws:s3:::{bucket}/*"})
+              s3.put_bucket_policy(Bucket=bucket, Policy=json.dumps(policy))
+
+              # Re-read the first page after removing it. This covers any number of uploads.
+              while True:
+                  check_time(context)
+                  uploads = s3.list_multipart_uploads(Bucket=bucket).get("Uploads", [])
+                  if not uploads:
+                      break
+                  for upload in uploads:
+                      check_time(context)
+                      allow_missing(s3.abort_multipart_upload, Bucket=bucket,
+                                    Key=upload["Key"], UploadId=upload["UploadId"])
+              while True:
+                  check_time(context)
+                  page = s3.list_object_versions(Bucket=bucket, MaxKeys=1000)
+                  # Deleting only current keys would leave older versions and delete markers.
+                  objects = [{"Key": item["Key"], "VersionId": item["VersionId"]}
+                             for item in page.get("Versions", []) + page.get("DeleteMarkers", [])]
+                  if not objects:
+                      return
+                  result = s3.delete_objects(Bucket=bucket, Delete={"Objects": objects, "Quiet": True})
+                  if result.get("Errors"):
+                      raise RuntimeError("S3 could not delete some versions: " + str(result["Errors"][:3]))
+
+
+          def clean_builds(context):
+              """Remove build history and its generated logs only after both builds are idle."""
+              build = client("codebuild")
+              ids = []
+              for suffix in ("validate", "deploy"):
+                  for page in pages(build.list_builds_for_project, context, "nextToken",
+                                    projectName=f"{PROJECT}-{suffix}"):
+                      ids.extend(page.get("ids", []))
+              for start in range(0, len(ids), 100):
+                  check_time(context)
+                  batch = build.batch_get_builds(ids=ids[start:start + 100])["builds"]
+                  if any(not item["buildComplete"] for item in batch):
+                      raise RuntimeError("Wait for or stop active CodeBuild builds, then retry stack deletion.")
+              for start in range(0, len(ids), 100):
+                  check_time(context)
+                  result = build.batch_delete_builds(ids=ids[start:start + 100])
+                  if result.get("buildsNotDeleted"):
+                      raise RuntimeError("CodeBuild history cleanup incomplete; retry deletion.")
+              for suffix in ("validate", "deploy"):
+                  allow_missing(client("logs").delete_log_group,
+                                logGroupName=f"/aws/codebuild/{PROJECT}-{suffix}")
+
+
+          def prepare_platform(context):
+              """Close admissions, require idle processing, then clear service-created leftovers."""
+              # Coordinator concurrency is one: a successful pause completes after any admission.
+              # If it is busy, CloudFormation reports failure; retry after the invocation finishes.
+              response = client("lambda").invoke(FunctionName=f"{PROJECT}-coordinator",
+                                                 Payload=b'{"action":"pause"}')
+              if response.get("FunctionError"):
+                  raise RuntimeError("Coordinator could not pause. Inspect its logs, then retry Delete.")
+              glue = client("glue")
+              for page in pages(glue.get_workflow_runs, context, Name=f"{PROJECT}-workflow"):
+                  if any(run["Status"] in {"RUNNING", "STOPPING"} for run in page.get("Runs", [])):
+                      raise RuntimeError("Wait for or stop the active Glue workflow, then retry Delete.")
+              crawler = glue.get_crawler(Name=f"{PROJECT}-raw-discovery")["Crawler"]
+              if crawler["State"] != "READY":
+                  raise RuntimeError("Wait for or stop the crawler, then retry Delete.")
+
+              # Collect job IDs before deleting anything; direct/manual job starts count too.
+              run_ids = []
+              for suffix in ("bronze", "silver", "gold"):
+                  for page in pages(glue.get_job_runs, context, JobName=f"{PROJECT}-{suffix}"):
+                      for run in page.get("JobRuns", []):
+                          if run["JobRunState"] not in {"SUCCEEDED", "FAILED", "STOPPED", "TIMEOUT", "ERROR", "EXPIRED"}:
+                              raise RuntimeError("Wait for or stop active Glue jobs, then retry Delete.")
+                          run_ids.append(run["Id"])
+
+              # Disable PITR just before table deletion to avoid an automatic 35-day system backup.
+              dynamodb = client("dynamodb")
+              dynamodb.update_continuous_backups(TableName=f"{PROJECT}-registry",
+                  PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": False})
+              while True:
+                  check_time(context)
+                  description = dynamodb.describe_continuous_backups(TableName=f"{PROJECT}-registry")
+                  status = description["ContinuousBackupsDescription"]["PointInTimeRecoveryDescription"]["PointInTimeRecoveryStatus"]
+                  if status == "DISABLED":
+                      break
+                  time.sleep(2)
+
+              # Crawler logs use a shared AWS group. Delete only streams returned for OUR crawler.
+              logs = client("logs")
+              streams = set()
+              for page in pages(glue.list_crawls, context, CrawlerName=f"{PROJECT}-raw-discovery"):
+                  for crawl in page.get("Crawls", []):
+                      if crawl.get("LogGroup") and crawl.get("LogStream"):
+                          streams.add((crawl["LogGroup"], crawl["LogStream"]))
+              last = crawler.get("LastCrawl", {})
+              if last.get("LogGroup") and last.get("LogStream"):
+                  streams.add((last["LogGroup"], last["LogStream"]))
+              for group, stream in streams:
+                  check_time(context)
+                  allow_missing(logs.delete_log_stream, logGroupName=group, logStreamName=stream)
+
+              # Older releases wrote job logs into shared default groups. Match exact run IDs.
+              # New releases use stack-owned log groups, which CloudFormation deletes itself.
+              for run_id in run_ids:
+                  for group in ("/aws-glue/jobs/error", "/aws-glue/jobs/output", "/aws-glue/jobs/logs-v2"):
+                      try:
+                          for page in pages(logs.describe_log_streams, context, "nextToken",
+                                            logGroupName=group, logStreamNamePrefix=run_id):
+                              for stream in page.get("logStreams", []):
+                                  name = stream["logStreamName"]
+                                  if name == run_id or name.startswith(run_id + "-"):
+                                      allow_missing(logs.delete_log_stream, logGroupName=group, logStreamName=name)
+                      except logs.exceptions.ResourceNotFoundException:
+                          pass
+
+
+          def handler(event, context):
+              """Always report success/failure to CloudFormation; never purge on normal updates."""
+              physical_id = event.get("PhysicalResourceId", event["StackId"] + "/" + event["LogicalResourceId"])
+              status, reason = cfnresponse.SUCCESS, "No deletion required."
+              try:
+                  if event["RequestType"] == "Delete":
+                      stack = client("cloudformation").describe_stacks(StackName=event["StackId"])["Stacks"][0]
+                      # Adding this helper in a failed UPDATE must not erase existing data on rollback.
+                      # A failed first CREATE may clean its new resources during ROLLBACK_IN_PROGRESS.
+                      if stack["StackStatus"] in {"DELETE_IN_PROGRESS", "ROLLBACK_IN_PROGRESS"}:
+                          mode = event["ResourceProperties"]["Mode"]
+                          if mode == "Platform":
+                              prepare_platform(context)
+                          elif mode in {"Data", "Artifacts"}:
+                              if mode == "Artifacts":
+                                  clean_builds(context)
+                              empty_bucket(event["ResourceProperties"]["Bucket"], context)
+                          else:
+                              raise ValueError("Unknown cleanup mode.")
+                          reason = "Cleanup completed."
+              except Exception as error:
+                  status, reason = cfnresponse.FAILED, str(error)[:1000]
+                  print("Cleanup failed:", reason)
+              cfnresponse.send(event, context, status, {}, physical_id, reason=reason)
+
+  # 15. Creates: A CloudFormation callback, not a continuously running service.
+  # Used by: CloudFormation before removing this bootstrap's pipeline/bucket resources.
+  # Why: Delete build history/logs and empty the versioned artifact bucket automatically.
+  ArtifactCleanup:
+    Type: Custom::EnvironmentCleanup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    # Reverse deletion order: finish cleanup while the projects/policy/role still exist.
+    DependsOn: [Pipeline, ArtifactPolicy, DeploymentRole]
+    Properties:
+      ServiceToken: !GetAtt 'CleanupFunction.Arn'
+      ServiceTimeout: 900
+      Mode: Artifacts
+      Bucket: !Ref 'ArtifactBucket'
+
+# Show these values in the stack Outputs tab for inspection and downstream use.
+Outputs:
+  PipelineName:
+    Value: !Ref 'Pipeline'
+  SourceBranch:
+    Value: !If [IsProduction, main, dev]
+  TargetEnvironment:
+    Value: !Ref 'Environment'
+  ArtifactBucket:
+    Value: !Ref 'ArtifactBucket'
+  DeploymentRoleArn:
+    Value: !GetAtt 'DeploymentRole.Arn'
+  # Foundation and platform import this value; CloudFormation therefore blocks
+  # deleting bootstrap while either application stack still needs its helper/permissions.
+  CleanupServiceToken:
+    Value: !GetAtt 'CleanupFunction.Arn'
+    Export:
+      Name: !Sub 'meesho-${Environment}-cleanup-service-token'

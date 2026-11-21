@@ -1,0 +1,17 @@
+# Development settings for the shared AWS account.
+# CodeBuild loads this file automatically; no local environment exports are needed.
+environment: dev
+
+# Only pushes to this Git branch start the development pipeline.
+branch: dev
+
+# Prefix for stacks, jobs, Lambdas, queues, roles and bucket names.
+# Account ID and Region are also appended to the globally unique S3 bucket names.
+project: meesho-dev
+
+# Glue/Athena database names use underscores: meesho_dev_bronze, _silver, _gold.
+database_prefix: meesho_dev
+
+# Optional notification mailbox. CloudFormation creates the SNS subscription;
+# the recipient confirms the email once. Leave blank to use the SNS topic only.
+alert_email: ''

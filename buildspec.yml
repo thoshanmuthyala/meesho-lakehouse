@@ -1,0 +1,34 @@
+# CodeBuild runs this file after source validation (and approval in production).
+# The developer's only deployment action is pushing code to dev or merging to main.
+# Bootstrap supplies the environment, artifact bucket, key and execution-role ARN.
+# ops/deploy.py deploys foundation.yaml and platform.yaml from this exact commit.
+version: 0.2
+
+phases:
+  install:
+    on-failure: ABORT
+    runtime-versions:
+      python: '3.11'
+    commands:
+      # Install the same pinned AWS SDK and template-validation dependencies as CI.
+      - pip install -r requirements-dev.txt
+
+  pre_build:
+    on-failure: ABORT
+    commands:
+      # Reject branch/config mismatches before touching any environment resource.
+      - python ops/environment.py --environment "$TARGET_ENVIRONMENT" --check-pipeline
+      # These AWS-provided values identify this immutable release without a local export.
+      - test -n "$CODEBUILD_RESOLVED_SOURCE_VERSION"
+      - test -n "$CODEBUILD_BUILD_NUMBER"
+
+  build:
+    on-failure: ABORT
+    commands:
+      # First release: create the data bucket, package code, deploy all runtime
+      # resources/permissions, verify the workflow graph and enable scheduling.
+      # Later releases: first block new admissions and drain the active workflow.
+      # Failure leaves processing paused for investigation; it never auto-resumes
+      # from a post_build phase after a failed infrastructure update.
+      # Business data is uploaded separately; a code push never seeds/replays it.
+      - python ops/deploy.py

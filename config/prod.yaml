@@ -1,0 +1,17 @@
+# Production settings for the SAME AWS account as development.
+# The code and templates are shared; storage and processing resources are separate.
+environment: prod
+
+# Protect main with pull-request review so reviewed merges start production releases.
+# The production pipeline also includes a manual approval before deployment.
+branch: main
+
+# A distinct prefix prevents this stack from updating development resources.
+project: meesho-prod
+
+# Production queries use these databases; they do not read development tables.
+database_prefix: meesho_prod
+
+# Optional notification mailbox. CloudFormation creates the SNS subscription;
+# the recipient confirms the email once. Leave blank to use the SNS topic only.
+alert_email: ''
