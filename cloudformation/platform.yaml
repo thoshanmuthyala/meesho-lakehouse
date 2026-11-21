@@ -384,7 +384,6 @@ Resources:
       Timeout: 300
       # Run one coordinator invocation at a time. The DynamoDB CONTROL item
       # continues protecting the Glue workflow after this short Lambda invocation ends.
-      ReservedConcurrentExecutions: 1
       # Load the exact ZIP that CodeBuild uploaded for ReleaseId.
       Code:
         S3Bucket: !Ref 'ArtifactBucket'
